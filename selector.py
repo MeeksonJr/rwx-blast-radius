@@ -1,5 +1,5 @@
 """MeeksonLabs Automated Test Selector for RWX Blast Radius
-Buildathon 2026
+Buildathon 2026 - Hardened Zero-Miss Engine
 """
 
 from __future__ import annotations
@@ -30,8 +30,9 @@ CORE_DIALECT_TEST_IDS = [
     "tests/test_parser.py::TestParser::test_comments_update_cte",
 ]
 
-# Fast optimizer smoke & validation suite
-OPTIMIZER_FAST_IDS = [
+# Optimizer comprehensive validation suite
+OPTIMIZER_COMP_IDS = [
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds",
     "tests/test_optimizer.py::TestOptimizer::test_tpcds",
     "tests/test_optimizer.py::TestOptimizer::test_tpch",
     "tests/test_optimizer.py::TestOptimizer::test_optimize",
@@ -45,34 +46,28 @@ FIXTURE_NAME_MAP = {
 }
 
 
-def is_semantic_noop(patch_text: str) -> bool:
-    """Detect if diff is purely cosmetic (comments, whitespace, or safe identity comparison on Enums/None)."""
-    lines = patch_text.splitlines()
-    added = [l[1:].strip() for l in lines if l.startswith("+") and not l.startswith("+++")]
-    removed = [l[1:].strip() for l in lines if l.startswith("-") and not l.startswith("---")]
+def is_pure_comment_or_whitespace(patch_text: str) -> bool:
+    """Only return True if diff modifies purely Python comments in .py files (never .sql fixtures)."""
+    # If patch touches .sql files, SQL comments matter -> not harmless
+    for line in patch_text.splitlines():
+        if line.startswith("+++ b/") and line.endswith(".sql"):
+            return False
 
-    added_code = [l for l in added if l and not l.startswith("#")]
-    removed_code = [l for l in removed if l and not l.startswith("#")]
-
-    if not added_code and not removed_code:
-        return True
-
-    if len(added_code) == len(removed_code):
-        all_equiv = True
-        for a, r in zip(added_code, removed_code):
-            a_norm = re.sub(r"\bis\s+None\b", "== None", a)
-            r_norm = re.sub(r"\bis\s+None\b", "== None", r)
-            a_norm = re.sub(r"\bis\s+not\s+None\b", "!= None", a_norm)
-            r_norm = re.sub(r"\bis\s+not\s+None\b", "!= None", r_norm)
-            a_norm = re.sub(r"\bis\s+([A-Z][a-zA-Z0-9_]*\.[A-Z0-9_]+)\b", r"== \1", a_norm)
-            r_norm = re.sub(r"\bis\s+([A-Z][a-zA-Z0-9_]*\.[A-Z0-9_]+)\b", r"== \1", r_norm)
-            if a_norm != r_norm:
-                all_equiv = False
-                break
-        if all_equiv:
-            return True
-
-    return False
+    for line in patch_text.splitlines():
+        if (
+            line.startswith("+++ ")
+            or line.startswith("--- ")
+            or line.startswith("diff --git")
+            or line.startswith("index ")
+            or line.startswith("@@")
+        ):
+            continue
+        if line.startswith("+") or line.startswith("-"):
+            content = line[1:].strip()
+            # Must strictly be a python comment
+            if content and not content.startswith("#"):
+                return False
+    return True
 
 
 def pack_tests(selected_test_numbers: list[int], tests_by_num: dict) -> list[list[int]]:
@@ -124,12 +119,9 @@ def main() -> None:
     core_dialect_nums = [
         tests_by_id[tid] for tid in CORE_DIALECT_TEST_IDS if tid in tests_by_id
     ]
-    optimizer_fast_nums = [
-        tests_by_id[tid] for tid in OPTIMIZER_FAST_IDS if tid in tests_by_id
+    optimizer_comp_nums = [
+        tests_by_id[tid] for tid in OPTIMIZER_COMP_IDS if tid in tests_by_id
     ]
-    tpcds_exec_num = tests_by_id.get(
-        "tests/test_executor.py::TestExecutor::test_execute_tpcds"
-    )
     mem_test_num = tests_by_id.get(
         "tests/test_generator.py::TestGenerator::test_generator_memory"
     )
@@ -146,8 +138,8 @@ def main() -> None:
         cid = patch_path.stem
         patch_text = patch_path.read_text(encoding="utf-8")
 
-        # 1. Semantic no-op (comments, whitespace, or safe identity comparison) -> 0 tests
-        if is_semantic_noop(patch_text):
+        # 1. Pure comment change in Python -> 0 tests
+        if is_pure_comment_or_whitespace(patch_text):
             print(json.dumps({"commit": cid, "workers": []}))
             continue
 
@@ -204,22 +196,7 @@ def main() -> None:
         if has_dialect:
             selected.update(core_dialect_nums)
         if has_optimizer:
-            selected.update(optimizer_fast_nums)
-
-        # Only run heavy 21.4s tpcds executor test if executor engine, serde, or eliminate_joins touched
-        needs_heavy_exec = any(
-            x in patch_text
-            for x in [
-                "sqlglot/executor/runner.py",
-                "sqlglot/executor/python.py",
-                "serde.py",
-                "eliminate_joins.py",
-            ]
-        )
-        if needs_heavy_exec and tpcds_exec_num:
-            selected.add(tpcds_exec_num)
-        elif tpcds_exec_num and tpcds_exec_num in selected:
-            selected.remove(tpcds_exec_num)
+            selected.update(optimizer_comp_nums)
 
         # Exclude slow memory test (6.7s) unless generator.py core touched
         if (
@@ -229,7 +206,7 @@ def main() -> None:
         ):
             selected.remove(mem_test_num)
 
-        # Exclude slow max_nodes recursion test (28.8s) unless parser.py core touched
+        # Exclude slow parser max_nodes recursion test (28.8s) unless parser.py core touched
         if (
             max_nodes_num
             and "sqlglot/parser.py" not in patch_text
