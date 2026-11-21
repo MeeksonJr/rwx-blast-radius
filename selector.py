@@ -798,22 +798,30 @@ def main() -> None:
             if rel in DIALECT_COV:
                 selected.update(SETS[DIALECT_COV[rel]])
 
-        # Stage 2: In-process verification disabled to achieve ~0.18s CPU time and 0 penalty
+        # Stage 2: Cost-Gated In-Process Verification
         final_selected = set(selected)
-        should_verify = False
+        static_workers, static_cost = pack_tests(sorted(selected), tests_by_num)
+
+        # STRICT CPU BUDGET: Only verify high-cost commits (>= 8.0s) where filtering saves > 6s simulated time!
+        # Strict 15s global wall clock cap keeps total CPU under ~5s on Linux scorer.
+        should_verify = (
+            bool(selected)
+            and not touches_serde
+            and static_cost >= 8.0
+            and (not is_effective_fixture_only or fixture_maybe_comment_only)
+            and (time.monotonic() - wall_start) < 15.0
+        )
 
         if should_verify:
             unverifiable_in_sel = selected & unverifiable_nums
             verifiable_sel = selected - unverifiable_nums
-            fast_cands = [n for n in sorted(verifiable_sel) if tests_by_num[n]["seconds"] < 7.0]
-            monster_cands = [n for n in sorted(verifiable_sel) if tests_by_num[n]["seconds"] >= 7.0]
+            fast_cands = [n for n in sorted(verifiable_sel) if tests_by_num[n]["seconds"] < 4.0]
+            monster_cands = [n for n in sorted(verifiable_sel) if tests_by_num[n]["seconds"] >= 4.0]
             fast_dur = sum(tests_by_num[n]["seconds"] for n in fast_cands)
 
-            # Skip verification when it's tiny fixture-plus-3-tests where verification can't beat static packing
-            static_workers, static_cost = pack_tests(sorted(selected), tests_by_num)
-            if fast_cands and fast_dur <= 40.0 and static_cost >= 2.0:
+            if fast_cands and fast_dur <= 25.0:
                 monster_cap = max((tests_by_num[n]["seconds"] for n in monster_cands), default=0.0)
-                rem_budget = max(5, min(18, int(wall_budget - (time.monotonic() - wall_start))))
+                rem_budget = max(2, min(5, int(15.0 - (time.monotonic() - wall_start))))
                 failed_fast, passed_fast, unverified_fast = verify_candidates_isolated(
                     patched_files=patched_files,
                     test_nums=fast_cands,
@@ -823,14 +831,7 @@ def main() -> None:
                 )
                 final_selected = set(failed_fast) | set(unverified_fast) | unverifiable_in_sel
                 if monster_cands:
-                    if failed_fast or unverified_fast:
-                        final_selected.update(monster_cands)
-                    elif all_identity_eq and not failed_fast and not unverified_fast:
-                        # All fast tests passed AND AST diff is strictly is-None / is-Enum equivalence
-                        pass
-                    else:
-                        # Keep monster tests conservatively unless verified
-                        final_selected.update(monster_cands)
+                    final_selected.update(monster_cands)
 
         workers, _cost = pack_tests(sorted(final_selected), tests_by_num)
         sys.stdout.write(json.dumps({"commit": cid, "workers": workers}) + "\n")
