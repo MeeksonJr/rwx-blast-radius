@@ -801,6 +801,7 @@ def main() -> None:
         # Stage 2: Cost-Gated In-Process Verification
         final_selected = set(selected)
         static_workers, static_cost = pack_tests(sorted(selected), tests_by_num)
+        is_effective_fixture_only = has_fixture_edit and active_non_fixture_files == 0
 
         # STRICT CPU BUDGET: Only verify high-cost commits (>= 8.0s) where filtering saves > 6s simulated time!
         # Strict 15s global wall clock cap keeps total CPU under ~5s on Linux scorer.
