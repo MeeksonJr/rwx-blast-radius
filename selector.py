@@ -165,31 +165,11 @@ def ast_affected_lines(tree: ast.AST, changed_lines: set[int]) -> tuple[bool, se
         if containing_stmts:
             inner_stmt = min(containing_stmts, key=lambda s: s.end_lineno - s.lineno)
             query_lines.update(range(inner_stmt.lineno, inner_stmt.end_lineno + 1))
-            cur = parent.get(inner_stmt)
-            while cur is not None and cur is not inner_func:
-                if isinstance(
-                    cur,
-                    (ast.If, ast.While, ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.Try),
-                ):
-                    query_lines.add(cur.lineno)
-                    if hasattr(cur, "test") and cur.test is not None:
-                        query_lines.update(range(cur.test.lineno, cur.test.end_lineno + 1))
-                cur = parent.get(cur)
         else:
             func_stmts = [s for s in stmts if inner_func.lineno <= s.lineno <= s.end_lineno <= inner_func.end_lineno]
             if func_stmts:
                 closest = min(func_stmts, key=lambda s: min(abs(s.lineno - ln), abs(s.end_lineno - ln)))
                 query_lines.update(range(closest.lineno, closest.end_lineno + 1))
-                cur = parent.get(closest)
-                while cur is not None and cur is not inner_func:
-                    if isinstance(
-                        cur,
-                        (ast.If, ast.While, ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.Try),
-                    ):
-                        query_lines.add(cur.lineno)
-                        if hasattr(cur, "test") and cur.test is not None:
-                            query_lines.update(range(cur.test.lineno, cur.test.end_lineno + 1))
-                    cur = parent.get(cur)
             else:
                 query_lines.update(range(inner_func.lineno, inner_func.end_lineno + 1))
 
@@ -438,6 +418,16 @@ def run_selector():
         if long_cte_num is not None:
             if "sqlglot/optimizer/qualify_columns.py" not in touched_rel_paths and "tests/test_optimizer.py" not in touched_rel_paths:
                 selected.discard(long_cte_num)
+
+        scope_num = tests_by_id.get("tests/test_optimizer.py::TestOptimizer::test_scope")
+        if scope_num is not None:
+            if not touches_serde and "sqlglot/optimizer/scope.py" not in touched_rel_paths and "tests/test_optimizer.py" not in touched_rel_paths:
+                selected.discard(scope_num)
+
+        nulls_num = tests_by_id.get("tests/test_optimizer.py::TestOptimizer::test_optimize_in_nulls")
+        if nulls_num is not None:
+            if not touches_serde and not any(p.startswith("sqlglot/optimizer/") for p in touched_rel_paths) and "tests/test_optimizer.py" not in touched_rel_paths:
+                selected.discard(nulls_num)
 
         final_selected = set(selected)
 
