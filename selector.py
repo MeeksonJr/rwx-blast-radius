@@ -1,19 +1,14 @@
+from __future__ import annotations
+
 import ast
 import copy
 import gzip
-import importlib
-import importlib.abc
-import importlib.util
-import io
 import json
 import os
 from pathlib import Path
 import re
-import signal
-import subprocess
 import sys
 import time
-import unittest
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = (Path("/data") if Path("/data").exists() else Path("sample")).resolve()
@@ -201,92 +196,6 @@ def pack_tests(selected_test_numbers: list[int], tests_by_num: dict[int, dict]) 
             best_workers = workers
 
     return [w for w in best_workers if w], best_cost
-
-
-class _PatchedLoader(importlib.abc.SourceLoader):
-    def __init__(self, fullname: str, path: str, source_bytes: bytes):
-        self.fullname = fullname
-        self.path = path
-        self.source_bytes = source_bytes
-
-    def get_filename(self, fullname: str) -> str:
-        return self.path
-
-    def get_data(self, path: str) -> bytes:
-        return self.source_bytes
-
-
-class _PatchedFinder(importlib.abc.MetaPathFinder):
-    def __init__(self, repo_dir: str, patched: dict[str, str]):
-        self.mod_map: dict[str, tuple[str, bytes, bool]] = {}
-        for rel, content in patched.items():
-            if not rel.endswith(".py"):
-                continue
-            full_path = os.path.join(repo_dir, *rel.split("/"))
-            if rel.endswith("/__init__.py"):
-                mod = rel[: -len("/__init__.py")].replace("/", ".")
-                is_pkg = True
-            else:
-                mod = rel[:-3].replace("/", ".")
-                is_pkg = False
-            self.mod_map[mod] = (full_path, content.encode("utf-8"), is_pkg)
-
-    def find_spec(self, fullname: str, path, target=None):
-        entry = self.mod_map.get(fullname)
-        if entry is None:
-            return None
-        full_path, src_bytes, is_pkg = entry
-        loader = _PatchedLoader(fullname, full_path, src_bytes)
-        spec = importlib.util.spec_from_loader(fullname, loader, origin=full_path, is_package=is_pkg)
-        if is_pkg and spec is not None:
-            spec.submodule_search_locations = [os.path.dirname(full_path)]
-        return spec
-
-
-def verify_candidates_in_memory(
-    patched_files: dict[str, str],
-    test_nums: list[int],
-    tests_by_num: dict[int, dict],
-    repo_dir: Path,
-) -> bool:
-    """Run candidate tests in memory. Returns True iff ALL candidate tests passed without errors."""
-    try:
-        repo_str = str(repo_dir.resolve())
-        finder = _PatchedFinder(repo_str, patched_files)
-        sys.meta_path.insert(0, finder)
-        if repo_str not in sys.path:
-            sys.path.insert(0, repo_str)
-
-        # Invalidate imported modules that are patched
-        for k in list(sys.modules.keys()):
-            if k.startswith(("sqlglot", "tests")):
-                del sys.modules[k]
-
-        by_cls: dict[tuple[str, str], list[str]] = {}
-        for n in test_nums:
-            parts = tests_by_num[n]["id"].split("::")
-            if len(parts) >= 3:
-                mod_name = parts[0][:-3].replace("/", ".")
-                cls_name = parts[1]
-                meth_name = parts[2]
-                by_cls.setdefault((mod_name, cls_name), []).append(meth_name)
-
-        suite = unittest.TestSuite()
-        for (mod_name, cls_name), meths in by_cls.items():
-            mod = importlib.import_module(mod_name)
-            cls = getattr(mod, cls_name)
-            for m in meths:
-                if hasattr(cls, m):
-                    suite.addTest(cls(m))
-
-        res = unittest.TestResult()
-        suite.run(res)
-        return res.wasSuccessful()
-    except BaseException:
-        return False
-    finally:
-        if finder in sys.meta_path:
-            sys.meta_path.remove(finder)
 
 
 def run_selector():
@@ -499,31 +408,7 @@ def run_selector():
             if "generator_memory" not in patch_text and "tests/test_generator.py" not in touched_rel_paths:
                 selected.discard(gen_mem_num)
 
-        # Fast Targeted In-Process Verification
         final_selected = set(selected)
-        can_verify = (
-            bool(selected)
-            and not touches_serde
-            and not has_fixture_edit
-            and len(selected) <= 30
-            and all(tests_by_num[n]["seconds"] < 0.50 for n in selected)
-            and all("test_executor.py" not in tests_by_num[n]["file"] for n in selected)
-            and all("test_parser.py" not in tests_by_num[n]["file"] for n in selected)
-            and sum(tests_by_num[n]["seconds"] for n in selected) <= 2.0
-            and (time.monotonic() - wall_start) < 8.0
-        )
-
-
-        if can_verify:
-            all_passed = verify_candidates_in_memory(
-                patched_files=patched_files,
-                test_nums=sorted(selected),
-                tests_by_num=tests_by_num,
-                repo_dir=REPO_DIR,
-            )
-
-            if all_passed:
-                final_selected = set()
 
         workers, _cost = pack_tests(sorted(final_selected), tests_by_num)
         sys.stdout.write(json.dumps({"commit": cid, "workers": workers}) + "\n")
