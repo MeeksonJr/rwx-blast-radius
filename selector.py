@@ -91,6 +91,12 @@ def parse_patch(patch_text: str) -> dict[str, dict]:
 
 def is_identity_eq_only(t_before: ast.AST, t_after: ast.AST) -> bool:
     class _NormIdentityEq(ast.NodeTransformer):
+        def visit_keyword(self, node: ast.keyword) -> ast.AST:
+            self.generic_visit(node)
+            if node.arg == "copy" and isinstance(node.value, ast.Constant) and isinstance(node.value.value, bool):
+                node.value.value = False
+            return node
+
         def visit_Compare(self, node: ast.Compare) -> ast.AST:
             self.generic_visit(node)
             new_ops = []
