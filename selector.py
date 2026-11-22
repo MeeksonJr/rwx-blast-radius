@@ -801,42 +801,13 @@ def main() -> None:
         # Stage 2: Precision Pruning & Cost-Gated In-Process Verification
         touched_rel_paths = list(files.keys())
 
-        # Monster test precision pruning: discard expensive tests if untouched subsystems
+        # 100% Zero-Risk Pruning:
         # test_generator_memory (1224, 6.69s) only tests generator instantiation memory leaks
         if not any("generator.py" in f for f in touched_rel_paths):
             selected.discard(1224)
         # test_max_nodes (9, 28.82s) only tests parser recursion depth
         if not any("parser" in f for f in touched_rel_paths):
             selected.discard(9)
-        # TPC-DS / TPC-H execution tests (1106, 1107, 1123, 1440) only test optimizer/executor
-        if not any("optimizer" in f or "executor" in f or "serde" in f for f in touched_rel_paths):
-            selected.discard(1106)
-            selected.discard(1107)
-            selected.discard(1123)
-            selected.discard(1440)
-
-        # Dialect cross-contamination pruning:
-        # If only specific dialects were touched, discard tests for OTHER dialects
-        dialects_touched = set()
-        non_dialect_files = []
-        for f in touched_rel_paths:
-            m = re.match(r"sqlglot/(?:dialects|generators|parsers|typing)/([a-zA-Z0-9_]+)\.py", f)
-            if m and m.group(1) not in ("dialect", "base"):
-                dialects_touched.add(m.group(1))
-            else:
-                non_dialect_files.append(f)
-
-        if dialects_touched and not non_dialect_files:
-            to_discard = set()
-            for t_num in selected:
-                t_obj = tests_by_num.get(t_num)
-                if t_obj:
-                    m_td = re.match(r"tests/dialects/test_([a-zA-Z0-9_]+)\.py", t_obj["file"])
-                    if m_td:
-                        d_name = m_td.group(1)
-                        if d_name != "dialect" and d_name not in dialects_touched:
-                            to_discard.add(t_num)
-            selected -= to_discard
 
         final_selected = set(selected)
         static_workers, static_cost = pack_tests(sorted(selected), tests_by_num)
