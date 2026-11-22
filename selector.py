@@ -446,6 +446,47 @@ def run_selector():
             ):
                 selected.discard(ann_num)
 
+        canon_num = tests_by_id.get("tests/test_optimizer.py::TestOptimizer::test_canonicalize")
+        if canon_num is not None:
+            if (
+                not touches_serde
+                and "sqlglot/optimizer/canonicalize.py" not in touched_rel_paths
+                and "tests/fixtures/optimizer/canonicalize.sql" not in touched_rel_paths
+                and "tests/test_optimizer.py" not in touched_rel_paths
+            ):
+                selected.discard(canon_num)
+
+        merge_num = tests_by_id.get("tests/test_optimizer.py::TestOptimizer::test_merge_subqueries")
+        if merge_num is not None:
+            if (
+                not touches_serde
+                and "sqlglot/optimizer/merge_subqueries.py" not in touched_rel_paths
+                and "tests/fixtures/optimizer/merge_subqueries.sql" not in touched_rel_paths
+                and "tests/test_optimizer.py" not in touched_rel_paths
+            ):
+                selected.discard(merge_num)
+
+        OPT_RULES = (
+            ("test_eliminate_ctes", "eliminate_ctes"),
+            ("test_eliminate_joins", "eliminate_joins"),
+            ("test_eliminate_subqueries", "eliminate_subqueries"),
+            ("test_isolate_table_selects", "isolate_table_selects"),
+            ("test_pushdown_cte_alias_columns", "pushdown_cte_alias_columns"),
+            ("test_pushdown_predicates", "pushdown_predicates"),
+            ("test_pushdown_projection", "pushdown_projection"),
+            ("test_unnest_subqueries", "unnest_subqueries"),
+        )
+        for meth, rname in OPT_RULES:
+            rnum = tests_by_id.get(f"tests/test_optimizer.py::TestOptimizer::{meth}")
+            if rnum is not None:
+                if (
+                    not touches_serde
+                    and f"sqlglot/optimizer/{rname}.py" not in touched_rel_paths
+                    and not any(rname in p for p in touched_rel_paths)
+                    and "tests/test_optimizer.py" not in touched_rel_paths
+                ):
+                    selected.discard(rnum)
+
         final_selected = set(selected)
 
         workers, _cost = pack_tests(sorted(final_selected), tests_by_num)
