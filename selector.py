@@ -225,12 +225,6 @@ def run_selector():
 
     typing_test_nums = set(tests_by_file.get("tests/test_typing.py", []))
 
-    dialect_names = set()
-    for t in tests_list:
-        if t["file"].startswith("tests/dialects/test_") and t["file"].endswith(".py"):
-            d = t["file"][len("tests/dialects/test_") : -3]
-            dialect_names.add(d)
-
     raw_idx = json.loads(gzip.open(INDEX_FILE, "rb").read().decode("utf-8"))
     idx_test_ids: list[str] = raw_idx["test_ids"]
     old_to_new: dict[int, int] = {}
@@ -404,29 +398,10 @@ def run_selector():
             if "generator_memory" not in patch_text and "tests/test_generator.py" not in touched_rel_paths:
                 selected.discard(gen_mem_num)
 
-        # Safe Foreign Dialect Exclusion:
-        # If all touched files belong strictly to specific dialects (and not core sqlglot/):
-        # We can safely discard tests for OTHER dialects (e.g. discard DuckDB tests for BigQuery changes).
-        # We KEEP all tests for touched dialects AND all core sqlglot tests (parser, optimizer, expressions, transpile).
-        touched_dialects = set()
-        for f in touched_rel_paths:
-            for d in dialect_names:
-                if f"/{d}.py" in f or f"/{d}/" in f or f"test_{d}.py" in f:
-                    touched_dialects.add(d)
-
-        is_dialect_only = bool(touched_dialects) and all(
-            any(k in f for k in ["dialects/", "generators/", "parsers/", "typing/"])
-            and not f.endswith("dialects/dialect.py")
-            for f in touched_rel_paths
-        )
-
-        if is_dialect_only:
-            for t in list(selected):
-                t_file = tests_by_num[t]["file"]
-                if t_file.startswith("tests/dialects/test_") and t_file.endswith(".py"):
-                    d = t_file[len("tests/dialects/test_") : -3]
-                    if d not in touched_dialects and d != "dialect":
-                        selected.discard(t)
+        schema_cache_num = tests_by_id.get("tests/test_schema.py::TestSchema::test_cache_does_not_retain_queries")
+        if schema_cache_num is not None:
+            if "sqlglot/schema.py" not in touched_rel_paths and "tests/test_schema.py" not in touched_rel_paths:
+                selected.discard(schema_cache_num)
 
         final_selected = set(selected)
 
