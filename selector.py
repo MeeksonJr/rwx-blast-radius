@@ -15,7 +15,7 @@ import sys
 import time
 import unittest
 
-APP_DIR = Path("submission_repo").resolve()
+APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = (Path("/data") if Path("/data").exists() else Path("sample")).resolve()
 REPO_DIR = (Path("/sqlglot") if Path("/sqlglot").exists() else Path("sqlglot-repo")).resolve()
 INDEX_FILE = APP_DIR / "super_index.json.gz"
