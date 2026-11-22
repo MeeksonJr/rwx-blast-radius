@@ -245,6 +245,32 @@ def run_selector():
     FIXTURE_COV: dict[str, int] = raw_idx["fixture_cov"]
     EXPR_CLASS_COV: dict[str, int] = raw_idx.get("expr_class_cov", {})
 
+    DIALECT_FAMILIES = {
+        'hive': {'hive', 'spark', 'spark2', 'databricks', 'dialect'},
+        'spark': {'spark', 'spark2', 'hive', 'databricks', 'dialect'},
+        'spark2': {'spark', 'spark2', 'hive', 'databricks', 'dialect'},
+        'databricks': {'databricks', 'spark', 'spark2', 'hive', 'dialect'},
+        'mysql': {'mysql', 'doris', 'singlestore', 'starrocks', 'dialect'},
+        'singlestore': {'singlestore', 'mysql', 'dialect'},
+        'doris': {'doris', 'mysql', 'dialect'},
+        'starrocks': {'starrocks', 'mysql', 'dialect'},
+        'postgres': {'postgres', 'materialize', 'redshift', 'risingwave', 'dialect'},
+        'materialize': {'materialize', 'postgres', 'dialect'},
+        'redshift': {'redshift', 'postgres', 'dialect'},
+        'risingwave': {'risingwave', 'postgres', 'dialect'},
+        'presto': {'presto', 'trino', 'athena', 'dune', 'dialect'},
+        'trino': {'trino', 'presto', 'athena', 'dune', 'dialect'},
+        'athena': {'athena', 'trino', 'presto', 'dialect'},
+        'dune': {'dune', 'trino', 'presto', 'dialect'},
+        'tsql': {'tsql', 'fabric', 'dialect'},
+        'fabric': {'fabric', 'tsql', 'dialect'},
+    }
+
+    def get_related_dialects(dname: str) -> set[str]:
+        if dname in DIALECT_FAMILIES:
+            return DIALECT_FAMILIES[dname]
+        return {dname, 'dialect'}
+
     def lookup_lines(rel: str, lines: set[int]) -> set[int]:
         runs = LINE_COV.get(rel)
         if not runs or not lines:
@@ -369,13 +395,26 @@ def run_selector():
                                 selected.update(SETS[EXPR_CLASS_COV[cname]])
                                 matched_expr_cls = True
                     if not matched_expr_cls:
+                        is_dialect_file = rel.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/"))
+                        dname = rel.split("/")[-1][:-3] if is_dialect_file else ""
                         if touched_classes and all("Tokenizer" in c for c in touched_classes) and rel.startswith(("sqlglot/dialects/", "sqlglot/tokens.py")):
-                            dname = rel.split("/")[-1][:-3] if rel.startswith("sqlglot/dialects/") else ""
                             allowed = {f"tests/dialects/test_{dname}.py", "tests/dialects/test_dialect.py", "tests/test_tokens.py"}
                             if rel in DIALECT_COV:
                                 selected.update(n for n in SETS[DIALECT_COV[rel]] if tests_by_num[n]["file"] in allowed)
                             if rel in FILE_COV:
                                 selected.update(n for n in SETS[FILE_COV[rel]] if tests_by_num[n]["file"] in allowed)
+                        elif is_dialect_file and dname:
+                            allowed_dialects = get_related_dialects(dname)
+                            def is_dialect_allowed(n: int) -> bool:
+                                f = tests_by_num[n]["file"]
+                                if f.startswith("tests/dialects/"):
+                                    tf_d = f.replace("tests/dialects/test_", "").replace(".py", "")
+                                    return tf_d in allowed_dialects
+                                return True
+                            if rel in DIALECT_COV:
+                                selected.update(n for n in SETS[DIALECT_COV[rel]] if is_dialect_allowed(n))
+                            if rel in FILE_COV:
+                                selected.update(n for n in SETS[FILE_COV[rel]] if is_dialect_allowed(n))
                         else:
                             if rel in DIALECT_COV:
                                 selected.update(SETS[DIALECT_COV[rel]])
@@ -487,8 +526,14 @@ def run_selector():
                 ):
                     selected.discard(rnum)
 
-        # Safe targeted monster executor test pruning (keep all small tests to guarantee 0 misses!)
-        if not touches_serde and "tests/test_executor.py" not in touched_rel_paths and not any(p.startswith(("sqlglot/executor/", "sqlglot/planner.py", "sqlglot/optimizer/")) for p in touched_rel_paths):
+        # Safe targeted monster executor test pruning (shield all dependencies to guarantee 0 misses!)
+        executor_deps = (
+            "sqlglot/executor/", "sqlglot/planner.py", "sqlglot/optimizer/",
+            "sqlglot/parser.py", "sqlglot/parsers/", "sqlglot/expressions/",
+            "sqlglot/tokens.py", "sqlglot/tokenizer_core.py", "sqlglot/generator.py", "sqlglot/generators/duckdb.py", "sqlglot/generators/python.py",
+            "sqlglot/schema.py", "sqlglot/serde.py", "tests/test_executor.py"
+        )
+        if not touches_serde and not any(p.startswith(executor_deps) for p in touched_rel_paths):
             for tname in ["test_execute_tpcds", "test_execute_tpch", "test_optimized_tpch"]:
                 tnum = tests_by_id.get(f"tests/test_executor.py::TestExecutor::{tname}")
                 if tnum is not None:
