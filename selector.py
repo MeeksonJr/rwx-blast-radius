@@ -49,13 +49,7 @@ import tracemalloc
 import unittest
 import unittest.mock
 
-# Pre-import heavy third-party deps ONCE before os.fork() on Linux
-for _mod in ("duckdb", "numpy", "pandas", "pytz", "dateutil", "dateutil.parser", "mypy_extensions", "typing_extensions"):
-    try:
-        importlib.import_module(_mod)
-    except Exception:
-        pass
-
+# Third-party pre-imports not needed in fast static selection
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = (Path("/data") if Path("/data").exists() else Path("sample")).resolve()
 REPO_DIR = (Path("/sqlglot") if Path("/sqlglot").exists() else Path("sqlglot-repo")).resolve()
@@ -810,28 +804,8 @@ def main() -> None:
         # 2. test_generator_memory (1224, 6.7s) only tests generator memory leaks
         gen_mem_num = tests_by_id.get("tests/test_generator.py::TestGenerator::test_generator_memory")
         if gen_mem_num is not None:
-            if "generator_memory" not in patch_text and "tests/test_generator.py" not in touched_rel_paths:
+            if "generator_memory" not in patch_text and not any("generator" in f for f in touched_rel_paths) and "tests/test_generator.py" not in touched_rel_paths:
                 selected.discard(gen_mem_num)
-
-        # 3. test_execute_tpcds (1106, 21.5s), test_execute_tpch (1107, 3.9s), test_optimized_tpch (1123, 3.5s)
-        # These execute standard SQL TPC-DS/H in the Python executor; unaffected by dialect-only edits!
-        tpcds_num = tests_by_id.get("tests/test_executor.py::TestExecutor::test_execute_tpcds")
-        tpch_num = tests_by_id.get("tests/test_executor.py::TestExecutor::test_execute_tpch")
-        opt_tpch_num = tests_by_id.get("tests/test_executor.py::TestExecutor::test_optimized_tpch")
-        has_executor_core = any(
-            f.startswith("sqlglot/executor/")
-            or f.startswith("sqlglot/optimizer/")
-            or f == "sqlglot/serde.py"
-            or "test_executor.py" in f
-            for f in touched_rel_paths
-        )
-        if not has_executor_core:
-            if tpcds_num is not None:
-                selected.discard(tpcds_num)
-            if tpch_num is not None:
-                selected.discard(tpch_num)
-            if opt_tpch_num is not None:
-                selected.discard(opt_tpch_num)
 
         final_selected = set(selected)
         workers, _cost = pack_tests(sorted(final_selected), tests_by_num)
