@@ -487,6 +487,22 @@ def run_selector():
                 ):
                     selected.discard(rnum)
 
+        # Global module isolation guards
+        if not touches_serde and "tests/test_executor.py" not in touched_rel_paths and not any(p.startswith(("sqlglot/executor/", "sqlglot/planner.py", "sqlglot/optimizer/")) for p in touched_rel_paths):
+            selected.difference_update(tests_by_file.get("tests/test_executor.py", []))
+
+        if "tests/test_tokens.py" not in touched_rel_paths and "sqlglot/tokens.py" not in touched_rel_paths:
+            selected.difference_update(tests_by_file.get("tests/test_tokens.py", []))
+
+        if "tests/test_schema.py" not in touched_rel_paths and "sqlglot/schema.py" not in touched_rel_paths:
+            selected.difference_update(tests_by_file.get("tests/test_schema.py", []))
+
+        if "tests/test_anonymize.py" not in touched_rel_paths and "sqlglot/anonymize.py" not in touched_rel_paths:
+            selected.difference_update(tests_by_file.get("tests/test_anonymize.py", []))
+
+        if "tests/test_diff.py" not in touched_rel_paths and "sqlglot/diff.py" not in touched_rel_paths:
+            selected.difference_update(tests_by_file.get("tests/test_diff.py", []))
+
         final_selected = set(selected)
 
         workers, _cost = pack_tests(sorted(final_selected), tests_by_num)
