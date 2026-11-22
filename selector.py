@@ -429,6 +429,17 @@ def run_selector():
             if not touches_serde and not any(p.startswith("sqlglot/optimizer/") for p in touched_rel_paths) and "tests/test_optimizer.py" not in touched_rel_paths:
                 selected.discard(nulls_num)
 
+        ann_num = tests_by_id.get("tests/test_optimizer.py::TestOptimizer::test_annotate_funcs")
+        if ann_num is not None:
+            if (
+                not touches_serde
+                and "sqlglot/optimizer/annotate_types.py" not in touched_rel_paths
+                and "sqlglot/parsers/bigquery.py" not in touched_rel_paths
+                and not any(p.startswith("sqlglot/typing/") for p in touched_rel_paths)
+                and "tests/test_optimizer.py" not in touched_rel_paths
+            ):
+                selected.discard(ann_num)
+
         final_selected = set(selected)
 
         workers, _cost = pack_tests(sorted(final_selected), tests_by_num)
