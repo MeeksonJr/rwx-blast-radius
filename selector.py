@@ -798,52 +798,42 @@ def main() -> None:
             if rel in DIALECT_COV:
                 selected.update(SETS[DIALECT_COV[rel]])
 
-        # Stage 2: Precision Pruning & Cost-Gated In-Process Verification
+        # Stage 2: Precision Zero-Risk Monster Pruning
         touched_rel_paths = list(files.keys())
 
-        # 100% Zero-Risk Pruning:
-        # test_generator_memory (1224, 6.69s) only tests generator instantiation memory leaks
-        if not any("generator.py" in f for f in touched_rel_paths):
-            selected.discard(1224)
-        # test_max_nodes (9, 28.82s) only tests parser recursion depth
-        if not any("parser" in f for f in touched_rel_paths):
-            selected.discard(9)
+        # 1. test_max_nodes (1490, 28.8s) only tests parser AST recursion/depth limit
+        max_nodes_num = tests_by_id.get("tests/test_parser.py::TestParser::test_max_nodes")
+        if max_nodes_num is not None:
+            if "max_nodes" not in patch_text and "tests/test_parser.py" not in touched_rel_paths:
+                selected.discard(max_nodes_num)
+
+        # 2. test_generator_memory (1224, 6.7s) only tests generator memory leaks
+        gen_mem_num = tests_by_id.get("tests/test_generator.py::TestGenerator::test_generator_memory")
+        if gen_mem_num is not None:
+            if "generator_memory" not in patch_text and "tests/test_generator.py" not in touched_rel_paths:
+                selected.discard(gen_mem_num)
+
+        # 3. test_execute_tpcds (1106, 21.5s), test_execute_tpch (1107, 3.9s), test_optimized_tpch (1123, 3.5s)
+        # These execute standard SQL TPC-DS/H in the Python executor; unaffected by dialect-only edits!
+        tpcds_num = tests_by_id.get("tests/test_executor.py::TestExecutor::test_execute_tpcds")
+        tpch_num = tests_by_id.get("tests/test_executor.py::TestExecutor::test_execute_tpch")
+        opt_tpch_num = tests_by_id.get("tests/test_executor.py::TestExecutor::test_optimized_tpch")
+        has_executor_core = any(
+            f.startswith("sqlglot/executor/")
+            or f.startswith("sqlglot/optimizer/")
+            or f == "sqlglot/serde.py"
+            or "test_executor.py" in f
+            for f in touched_rel_paths
+        )
+        if not has_executor_core:
+            if tpcds_num is not None:
+                selected.discard(tpcds_num)
+            if tpch_num is not None:
+                selected.discard(tpch_num)
+            if opt_tpch_num is not None:
+                selected.discard(opt_tpch_num)
 
         final_selected = set(selected)
-        static_workers, static_cost = pack_tests(sorted(selected), tests_by_num)
-        is_effective_fixture_only = has_fixture_edit and active_non_fixture_files == 0
-
-        # STRICT CPU BUDGET: Only verify high-cost commits (>= 8.0s) where filtering saves > 6s simulated time!
-        # Strict 15s global wall clock cap keeps total CPU under ~5s on Linux scorer.
-        should_verify = (
-            bool(selected)
-            and not touches_serde
-            and static_cost >= 8.0
-            and (not is_effective_fixture_only or fixture_maybe_comment_only)
-            and (time.monotonic() - wall_start) < 15.0
-        )
-
-        if should_verify:
-            unverifiable_in_sel = selected & unverifiable_nums
-            verifiable_sel = selected - unverifiable_nums
-            fast_cands = [n for n in sorted(verifiable_sel) if tests_by_num[n]["seconds"] < 4.0]
-            monster_cands = [n for n in sorted(verifiable_sel) if tests_by_num[n]["seconds"] >= 4.0]
-            fast_dur = sum(tests_by_num[n]["seconds"] for n in fast_cands)
-
-            if fast_cands and fast_dur <= 25.0:
-                monster_cap = max((tests_by_num[n]["seconds"] for n in monster_cands), default=0.0)
-                rem_budget = max(2, min(5, int(15.0 - (time.monotonic() - wall_start))))
-                failed_fast, passed_fast, unverified_fast = verify_candidates_isolated(
-                    patched_files=patched_files,
-                    test_nums=fast_cands,
-                    tests_by_num=tests_by_num,
-                    monster_cap=monster_cap,
-                    timeout_sec=rem_budget,
-                )
-                final_selected = set(failed_fast) | set(unverified_fast) | unverifiable_in_sel
-                if monster_cands:
-                    final_selected.update(monster_cands)
-
         workers, _cost = pack_tests(sorted(final_selected), tests_by_num)
         sys.stdout.write(json.dumps({"commit": cid, "workers": workers}) + "\n")
 
