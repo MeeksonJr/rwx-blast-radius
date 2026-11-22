@@ -487,21 +487,12 @@ def run_selector():
                 ):
                     selected.discard(rnum)
 
-        # Global module isolation guards
+        # Safe targeted monster executor test pruning (keep all small tests to guarantee 0 misses!)
         if not touches_serde and "tests/test_executor.py" not in touched_rel_paths and not any(p.startswith(("sqlglot/executor/", "sqlglot/planner.py", "sqlglot/optimizer/")) for p in touched_rel_paths):
-            selected.difference_update(tests_by_file.get("tests/test_executor.py", []))
-
-        if "tests/test_tokens.py" not in touched_rel_paths and "sqlglot/tokens.py" not in touched_rel_paths:
-            selected.difference_update(tests_by_file.get("tests/test_tokens.py", []))
-
-        if "tests/test_schema.py" not in touched_rel_paths and "sqlglot/schema.py" not in touched_rel_paths:
-            selected.difference_update(tests_by_file.get("tests/test_schema.py", []))
-
-        if "tests/test_anonymize.py" not in touched_rel_paths and "sqlglot/anonymize.py" not in touched_rel_paths:
-            selected.difference_update(tests_by_file.get("tests/test_anonymize.py", []))
-
-        if "tests/test_diff.py" not in touched_rel_paths and "sqlglot/diff.py" not in touched_rel_paths:
-            selected.difference_update(tests_by_file.get("tests/test_diff.py", []))
+            for tname in ["test_execute_tpcds", "test_execute_tpch", "test_optimized_tpch"]:
+                tnum = tests_by_id.get(f"tests/test_executor.py::TestExecutor::{tname}")
+                if tnum is not None:
+                    selected.discard(tnum)
 
         final_selected = set(selected)
 
