@@ -475,6 +475,10 @@ def run_selector():
             ("test_pushdown_predicates", "pushdown_predicates"),
             ("test_pushdown_projection", "pushdown_projection"),
             ("test_unnest_subqueries", "unnest_subqueries"),
+            ("test_normalize", "normalize"),
+            ("test_normalize_identifiers", "normalize_identifiers"),
+            ("test_optimize_joins", "optimize_joins"),
+            ("test_canonicalize_internal_names", "canonicalize_internal_names"),
         )
         for meth, rname in OPT_RULES:
             rnum = tests_by_id.get(f"tests/test_optimizer.py::TestOptimizer::{meth}")
