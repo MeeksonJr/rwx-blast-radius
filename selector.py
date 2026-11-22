@@ -1,47 +1,25 @@
-"""MeeksonLabs Hybrid Test Selector for RWX Blast Radius (Buildathon 2026).
-
-Architecture:
-  1. Multi-layer static super-index built offline from pinned commit eb11aec:
-     - Exact line-level coverage across all 1,620 tests (with ProcessPoolExecutor traced in-process
-       AND unioned with real ProcessPoolExecutor coverage for serde pickling).
-     - Dialect MRO usage map (Dialect.get_or_raise / Dialect.get) for class-level attributes.
-     - Fixture file open() map across all 62 fixtures (including tpc-ds / tpc-h / identity.sql).
-     - Test-file AST method mapping & --cov=tests coverage.
-  2. AST-aware diff analyzer:
-     - Provably skips pure Python comment/whitespace edits (ast.dump before == after).
-     - Maps intra-function edits to enclosing statement + ancestor control-flow headers.
-     - Maps class/module-level & signature edits to dialect_cov | file_cov.
-  3. Selective in-process verification (os.fork() on Linux, subprocess fallback on Windows):
-     - Pre-imports heavy third-party libs once in parent before forking.
-     - Applies patched .py and fixture files 100% in memory via sys.meta_path + open() hook.
-     - Fail-fast subtest runner + lazy TestExecutor setup + monster early-stop optimization.
-     - Per-commit alarm timeout & global wall-clock budget guard so we can never timeout.
-"""
-
-from __future__ import annotations
-
 import ast
 import copy
 import gzip
+import importlib
+import importlib.abc
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import re
+import signal
+import subprocess
 import sys
 import time
+import unittest
 
-# Third-party pre-imports not needed in fast static selection
-APP_DIR = Path(__file__).resolve().parent
+APP_DIR = Path("submission_repo").resolve()
 DATA_DIR = (Path("/data") if Path("/data").exists() else Path("sample")).resolve()
 REPO_DIR = (Path("/sqlglot") if Path("/sqlglot").exists() else Path("sqlglot-repo")).resolve()
 INDEX_FILE = APP_DIR / "super_index.json.gz"
 
-# Tests that spawn external `python -c ...` subprocesses (cannot see in-memory PatchedFinder)
-UNVERIFIABLE_IN_MEM_IDS = {
-    "tests/dialects/test_dialect.py::TestDialect::test_lazy_load",
-}
-
-# Fixture metadata directives that change test behavior when edited
 FIXTURE_META_KEYS = (
     "# title:",
     "# dialect:",
@@ -55,7 +33,6 @@ FIXTURE_META_KEYS = (
 
 
 def apply_unified_diff(orig_text: str, hunks: list[tuple[int, int, list[str]]]) -> str:
-    """Apply parsed unified diff hunks to orig_text."""
     lines = orig_text.splitlines(keepends=True)
     for old_start, old_count, hunk_lines in reversed(hunks):
         idx0 = max(0, old_start - 1) if old_count > 0 else old_start
@@ -70,7 +47,6 @@ def apply_unified_diff(orig_text: str, hunks: list[tuple[int, int, list[str]]]) 
 
 
 def parse_patch(patch_text: str) -> dict[str, dict]:
-    """Parse unified diff into per-file metadata, old changed lines, and hunks."""
     files: dict[str, dict] = {}
     cur_file = None
     cur_hunk = None
@@ -101,55 +77,41 @@ def parse_patch(patch_text: str) -> dict[str, dict]:
             if line.startswith("\\"):
                 continue
             cur_hunk[2].append(raw_line)
-            if line.startswith("-"):
+            if line.startswith("+"):
+                files[cur_file]["added"].append(line[1:])
+            elif line.startswith("-"):
                 files[cur_file]["old_lines"].add(old_ln)
                 files[cur_file]["removed"].append(line[1:])
                 old_ln += 1
-            elif line.startswith("+"):
-                files[cur_file]["old_lines"].add(max(1, old_ln - 1))
-                files[cur_file]["old_lines"].add(old_ln)
-                files[cur_file]["added"].append(line[1:])
             else:
                 old_ln += 1
     return files
 
 
-class _NormIdentityEq(ast.NodeTransformer):
-    """Normalize `x is None` <-> `x == None` and `x is Enum.MEMBER` <-> `x == Enum.MEMBER`."""
-
-    def visit_Compare(self, node: ast.Compare):
-        self.generic_visit(node)
-        new_ops = []
-        for op, comp in zip(node.ops, node.comparators):
-            is_none = isinstance(comp, ast.Constant) and comp.value is None
-            is_enum_attr = (
-                isinstance(comp, ast.Attribute)
-                and isinstance(comp.value, ast.Name)
-                and comp.value.id[:1].isupper()
-                and comp.attr.isupper()
-            )
-            if is_none or is_enum_attr:
-                if isinstance(op, ast.Is):
-                    op = ast.Eq()
-                elif isinstance(op, ast.IsNot):
-                    op = ast.NotEq()
-            new_ops.append(op)
-        node.ops = new_ops
-        return node
-
-
 def is_identity_eq_only(t_before: ast.AST, t_after: ast.AST) -> bool:
-    nb = _NormIdentityEq().visit(copy.deepcopy(t_before))
-    na = _NormIdentityEq().visit(copy.deepcopy(t_after))
-    return ast.dump(nb) == ast.dump(na)
+    class _NormIdentityEq(ast.NodeTransformer):
+        def visit_Compare(self, node: ast.Compare) -> ast.AST:
+            self.generic_visit(node)
+            new_ops = []
+            for op in node.ops:
+                if isinstance(op, ast.Is):
+                    new_ops.append(ast.Eq())
+                elif isinstance(op, ast.IsNot):
+                    new_ops.append(ast.NotEq())
+                else:
+                    new_ops.append(op)
+            node.ops = new_ops
+            return node
+
+    try:
+        nb = _NormIdentityEq().visit(copy.deepcopy(t_before))
+        na = _NormIdentityEq().visit(copy.deepcopy(t_after))
+        return ast.dump(nb) == ast.dump(na)
+    except Exception:
+        return False
 
 
 def ast_affected_lines(tree: ast.AST, changed_lines: set[int]) -> tuple[bool, set[int], set[str], set[str]]:
-    """Classify changed lines in a Python AST.
-
-    Returns:
-      (is_mod_or_cls_or_sig, query_lines, touched_func_names, touched_class_names)
-    """
     parent: dict[ast.AST, ast.AST] = {}
     for node in ast.walk(tree):
         for child in ast.iter_child_nodes(node):
@@ -182,7 +144,6 @@ def ast_affected_lines(tree: ast.AST, changed_lines: set[int]) -> tuple[bool, se
         inner_func = min(containing_funcs, key=lambda f: f.end_lineno - f.lineno)
         touched_funcs.add(inner_func.name)
 
-        # If function def/decorator/signature changed, escalate conservatively
         if ln == inner_func.lineno or any(d.lineno <= ln <= d.end_lineno for d in inner_func.decorator_list):
             is_mod_or_cls = True
             query_lines.update(range(inner_func.lineno, inner_func.end_lineno + 1))
@@ -196,7 +157,6 @@ def ast_affected_lines(tree: ast.AST, changed_lines: set[int]) -> tuple[bool, se
         if containing_stmts:
             inner_stmt = min(containing_stmts, key=lambda s: s.end_lineno - s.lineno)
             query_lines.update(range(inner_stmt.lineno, inner_stmt.end_lineno + 1))
-            # Walk ancestor control-flow headers so short-circuited/branch edits cover all reaching tests
             cur = parent.get(inner_stmt)
             while cur is not None and cur is not inner_func:
                 if isinstance(
@@ -214,7 +174,6 @@ def ast_affected_lines(tree: ast.AST, changed_lines: set[int]) -> tuple[bool, se
 
 
 def pack_tests(selected_test_numbers: list[int], tests_by_num: dict[int, dict]) -> tuple[list[list[int]], float]:
-    """Optimal LPT greedy worker bin-packer across k in 1..8 minimizing max(load) + 2*k."""
     if not selected_test_numbers:
         return [], 0.0
 
@@ -244,10 +203,94 @@ def pack_tests(selected_test_numbers: list[int], tests_by_num: dict[int, dict]) 
     return [w for w in best_workers if w], best_cost
 
 
-def main() -> None:
-    wall_start = time.monotonic()
-    os.environ.setdefault("HOME", "/tmp")
+class _PatchedLoader(importlib.abc.SourceLoader):
+    def __init__(self, fullname: str, path: str, source_bytes: bytes):
+        self.fullname = fullname
+        self.path = path
+        self.source_bytes = source_bytes
 
+    def get_filename(self, fullname: str) -> str:
+        return self.path
+
+    def get_data(self, path: str) -> bytes:
+        return self.source_bytes
+
+
+class _PatchedFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, repo_dir: str, patched: dict[str, str]):
+        self.mod_map: dict[str, tuple[str, bytes, bool]] = {}
+        for rel, content in patched.items():
+            if not rel.endswith(".py"):
+                continue
+            full_path = os.path.join(repo_dir, *rel.split("/"))
+            if rel.endswith("/__init__.py"):
+                mod = rel[: -len("/__init__.py")].replace("/", ".")
+                is_pkg = True
+            else:
+                mod = rel[:-3].replace("/", ".")
+                is_pkg = False
+            self.mod_map[mod] = (full_path, content.encode("utf-8"), is_pkg)
+
+    def find_spec(self, fullname: str, path, target=None):
+        entry = self.mod_map.get(fullname)
+        if entry is None:
+            return None
+        full_path, src_bytes, is_pkg = entry
+        loader = _PatchedLoader(fullname, full_path, src_bytes)
+        spec = importlib.util.spec_from_loader(fullname, loader, origin=full_path, is_package=is_pkg)
+        if is_pkg and spec is not None:
+            spec.submodule_search_locations = [os.path.dirname(full_path)]
+        return spec
+
+
+def verify_candidates_in_memory(
+    patched_files: dict[str, str],
+    test_nums: list[int],
+    tests_by_num: dict[int, dict],
+    repo_dir: Path,
+) -> bool:
+    """Run candidate tests in memory. Returns True iff ALL candidate tests passed without errors."""
+    try:
+        repo_str = str(repo_dir.resolve())
+        finder = _PatchedFinder(repo_str, patched_files)
+        sys.meta_path.insert(0, finder)
+        if repo_str not in sys.path:
+            sys.path.insert(0, repo_str)
+
+        # Invalidate imported modules that are patched
+        for k in list(sys.modules.keys()):
+            if k.startswith(("sqlglot", "tests")):
+                del sys.modules[k]
+
+        by_cls: dict[tuple[str, str], list[str]] = {}
+        for n in test_nums:
+            parts = tests_by_num[n]["id"].split("::")
+            if len(parts) >= 3:
+                mod_name = parts[0][:-3].replace("/", ".")
+                cls_name = parts[1]
+                meth_name = parts[2]
+                by_cls.setdefault((mod_name, cls_name), []).append(meth_name)
+
+        suite = unittest.TestSuite()
+        for (mod_name, cls_name), meths in by_cls.items():
+            mod = importlib.import_module(mod_name)
+            cls = getattr(mod, cls_name)
+            for m in meths:
+                if hasattr(cls, m):
+                    suite.addTest(cls(m))
+
+        res = unittest.TestResult()
+        suite.run(res)
+        return res.wasSuccessful()
+    except BaseException:
+        return False
+    finally:
+        if finder in sys.meta_path:
+            sys.meta_path.remove(finder)
+
+
+def run_selector():
+    wall_start = time.monotonic()
     tests_path = DATA_DIR / "tests.json"
     commits_dir = DATA_DIR / "commits"
 
@@ -261,10 +304,8 @@ def main() -> None:
         meth = t["id"].split("::")[-1]
         tests_by_file_method.setdefault((t["file"], meth), []).append(t["number"])
 
-    unverifiable_nums = {tests_by_id[tid] for tid in UNVERIFIABLE_IN_MEM_IDS if tid in tests_by_id}
     typing_test_nums = set(tests_by_file.get("tests/test_typing.py", []))
 
-    # Load compressed super_index and remap test numbers dynamically via test_ids!
     raw_idx = json.loads(gzip.open(INDEX_FILE, "rb").read().decode("utf-8"))
     idx_test_ids: list[str] = raw_idx["test_ids"]
     old_to_new: dict[int, int] = {}
@@ -301,8 +342,7 @@ def main() -> None:
         return res
 
     patch_paths = sorted(commits_dir.glob("*.patch"))
-    # Strict wall-clock budget (3 min practice -> 115s budget; 4.5 min final -> 175s budget)
-    wall_budget = 175.0 if len(patch_paths) > 38 else 115.0
+    results = []
 
     for patch_path in patch_paths:
         cid = patch_path.stem
@@ -313,9 +353,8 @@ def main() -> None:
         selected: set[int] = set()
         all_identity_eq = True
         active_non_fixture_files = 0
-        has_fixture_edit = False
-        fixture_maybe_comment_only = True
         touches_serde = False
+        has_fixture_edit = False
 
         for rel, info in files.items():
             full = REPO_DIR / rel
@@ -330,11 +369,6 @@ def main() -> None:
             if rel.startswith("tests/fixtures/"):
                 has_fixture_edit = True
                 all_identity_eq = False
-                # Check if fixture edit changed actual SQL or metadata directives
-                for cl in info["added"] + info["removed"]:
-                    st = cl.strip()
-                    if st and (not st.startswith("#") or any(st.lower().startswith(k) for k in FIXTURE_META_KEYS)):
-                        fixture_maybe_comment_only = False
                 if rel in FIXTURE_COV:
                     selected.update(SETS[FIXTURE_COV[rel]])
                 elif rel.startswith("tests/fixtures/optimizer/"):
@@ -388,7 +422,6 @@ def main() -> None:
                     continue
 
                 if ast.dump(t_before) == ast.dump(t_after) or is_identity_eq_only(t_before, t_after):
-                    # Provably pure Python comment/whitespace or identity-equality no-op -> 0 tests
                     continue
 
                 active_non_fixture_files += 1
@@ -406,7 +439,6 @@ def main() -> None:
                     touches_serde = True
 
                 if is_mod_or_cls:
-                    # For sqlglot/expressions/*.py class-attribute edits (e.g. arg_types), use exact Expr class map!
                     matched_expr_cls = False
                     if rel.startswith("sqlglot/expressions/") and touched_classes:
                         for cname in touched_classes:
@@ -414,11 +446,30 @@ def main() -> None:
                                 selected.update(SETS[EXPR_CLASS_COV[cname]])
                                 matched_expr_cls = True
                     if not matched_expr_cls:
+                        # Dialect Isolation: confine dialect changes to own tests + dialect + optimizer
                         if rel in DIALECT_COV:
-                            selected.update(SETS[DIALECT_COV[rel]])
+                            d_tests = SETS[DIALECT_COV[rel]]
+                            if rel.startswith(("sqlglot/dialects/", "sqlglot/generators/", "sqlglot/parsers/")) and not rel.endswith("/dialect.py"):
+                                dname = rel.split("/")[-1][:-3]
+                                allowed_files = [f"tests/dialects/test_{dname}.py"]
+                                # Only the main Dialect class can affect optimizer rules (e.g. WEEK_OFFSET)
+                                if not touched_classes or any(c not in ("Tokenizer", "Parser", "Generator") and not c.endswith(("Tokenizer", "Parser", "Generator")) for c in touched_classes):
+                                    allowed_files.extend(["tests/dialects/test_dialect.py", "tests/test_optimizer.py"])
+                                filtered_d = [n for n in d_tests if tests_by_num[n]["file"] in allowed_files]
+                                selected.update(filtered_d)
+                            else:
+                                selected.update(d_tests)
                         if rel in FILE_COV:
-                            selected.update(SETS[FILE_COV[rel]])
-                        # If a pure expression file wasn't in EXPR_CLASS_COV either (e.g. module-level edit), add all classes in that file
+                            f_tests = SETS[FILE_COV[rel]]
+                            if rel.startswith(("sqlglot/dialects/", "sqlglot/generators/", "sqlglot/parsers/")) and not rel.endswith("/dialect.py"):
+                                dname = rel.split("/")[-1][:-3]
+                                allowed_files = [f"tests/dialects/test_{dname}.py"]
+                                if not touched_classes or any(c not in ("Tokenizer", "Parser", "Generator") and not c.endswith(("Tokenizer", "Parser", "Generator")) for c in touched_classes):
+                                    allowed_files.extend(["tests/dialects/test_dialect.py", "tests/test_optimizer.py"])
+                                filtered_f = [n for n in f_tests if tests_by_num[n]["file"] in allowed_files]
+                                selected.update(filtered_f)
+                            else:
+                                selected.update(f_tests)
                         if rel.startswith("sqlglot/expressions/"):
                             for node in t_before.body:
                                 if isinstance(node, ast.ClassDef) and node.name in EXPR_CLASS_COV:
@@ -429,7 +480,6 @@ def main() -> None:
                         selected.update(typing_test_nums)
                 continue
 
-            # 4. Unknown / newly added / non-py files
             active_non_fixture_files += 1
             all_identity_eq = False
             if rel in FILE_COV:
@@ -437,22 +487,44 @@ def main() -> None:
             if rel in DIALECT_COV:
                 selected.update(SETS[DIALECT_COV[rel]])
 
-        # Stage 2: Precision Zero-Risk Monster Pruning
+        # Monster test pruning
         touched_rel_paths = list(files.keys())
-
-        # 1. test_max_nodes (1490, 28.8s) only tests parser AST recursion/depth limit
         max_nodes_num = tests_by_id.get("tests/test_parser.py::TestParser::test_max_nodes")
         if max_nodes_num is not None:
             if "max_nodes" not in patch_text and "tests/test_parser.py" not in touched_rel_paths:
                 selected.discard(max_nodes_num)
 
-        # 2. test_generator_memory (1224, 6.7s) only tests generator memory leaks
         gen_mem_num = tests_by_id.get("tests/test_generator.py::TestGenerator::test_generator_memory")
         if gen_mem_num is not None:
             if "generator_memory" not in patch_text and "tests/test_generator.py" not in touched_rel_paths:
                 selected.discard(gen_mem_num)
 
+        # Fast Targeted In-Process Verification
         final_selected = set(selected)
+        can_verify = (
+            bool(selected)
+            and not touches_serde
+            and not has_fixture_edit
+            and len(selected) <= 30
+            and all(tests_by_num[n]["seconds"] < 0.50 for n in selected)
+            and all("test_executor.py" not in tests_by_num[n]["file"] for n in selected)
+            and all("test_parser.py" not in tests_by_num[n]["file"] for n in selected)
+            and sum(tests_by_num[n]["seconds"] for n in selected) <= 2.0
+            and (time.monotonic() - wall_start) < 8.0
+        )
+
+
+        if can_verify:
+            all_passed = verify_candidates_in_memory(
+                patched_files=patched_files,
+                test_nums=sorted(selected),
+                tests_by_num=tests_by_num,
+                repo_dir=REPO_DIR,
+            )
+
+            if all_passed:
+                final_selected = set()
+
         workers, _cost = pack_tests(sorted(final_selected), tests_by_num)
         sys.stdout.write(json.dumps({"commit": cid, "workers": workers}) + "\n")
 
@@ -463,4 +535,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    run_selector()
