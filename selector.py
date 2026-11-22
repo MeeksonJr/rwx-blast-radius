@@ -74,6 +74,9 @@ def parse_patch(patch_text: str) -> dict[str, dict]:
             cur_hunk[2].append(raw_line)
             if line.startswith("+"):
                 files[cur_file]["added"].append(line[1:])
+                # Map additions to surrounding old lines for coverage lookup
+                files[cur_file]["old_lines"].add(max(1, old_ln - 1))
+                files[cur_file]["old_lines"].add(old_ln)
             elif line.startswith("-"):
                 files[cur_file]["old_lines"].add(old_ln)
                 files[cur_file]["removed"].append(line[1:])
@@ -88,13 +91,20 @@ def is_identity_eq_only(t_before: ast.AST, t_after: ast.AST) -> bool:
         def visit_Compare(self, node: ast.Compare) -> ast.AST:
             self.generic_visit(node)
             new_ops = []
-            for op in node.ops:
-                if isinstance(op, ast.Is):
-                    new_ops.append(ast.Eq())
-                elif isinstance(op, ast.IsNot):
-                    new_ops.append(ast.NotEq())
-                else:
-                    new_ops.append(op)
+            for op, comp in zip(node.ops, node.comparators):
+                is_none = isinstance(comp, ast.Constant) and comp.value is None
+                is_enum_attr = (
+                    isinstance(comp, ast.Attribute)
+                    and isinstance(comp.value, ast.Name)
+                    and comp.value.id[:1].isupper()
+                    and comp.attr.isupper()
+                )
+                if is_none or is_enum_attr:
+                    if isinstance(op, ast.Is):
+                        op = ast.Eq()
+                    elif isinstance(op, ast.IsNot):
+                        op = ast.NotEq()
+                new_ops.append(op)
             node.ops = new_ops
             return node
 
@@ -180,22 +190,22 @@ def pack_tests(selected_test_numbers: list[int], tests_by_num: dict[int, dict]) 
     )
 
     best_workers = None
-    best_cost = float("inf")
+    best_cost_ms = float("inf")
     max_k = min(8, len(tests_sorted))
     for k in range(1, max_k + 1):
         workers: list[list[int]] = [[] for _ in range(k)]
-        loads = [0.0] * k
+        loads_ms = [0] * k
         for tn in tests_sorted:
-            dur = tests_by_num[tn]["seconds"] if tn in tests_by_num else 0.0
-            lightest = loads.index(min(loads))
+            dur_ms = round(tests_by_num[tn]["seconds"] * 1000) if tn in tests_by_num else 0
+            lightest = loads_ms.index(min(loads_ms))
             workers[lightest].append(tn)
-            loads[lightest] += dur
-        cost = max(loads) + 2.0 * k
-        if cost < best_cost:
-            best_cost = cost
+            loads_ms[lightest] += dur_ms
+        cost_ms = max(loads_ms) + 2000 * k
+        if cost_ms < best_cost_ms:
+            best_cost_ms = cost_ms
             best_workers = workers
 
-    return [w for w in best_workers if w], best_cost
+    return [w for w in best_workers if w], best_cost_ms / 1000.0
 
 
 def run_selector():
@@ -214,6 +224,12 @@ def run_selector():
         tests_by_file_method.setdefault((t["file"], meth), []).append(t["number"])
 
     typing_test_nums = set(tests_by_file.get("tests/test_typing.py", []))
+
+    dialect_names = set()
+    for t in tests_list:
+        if t["file"].startswith("tests/dialects/test_") and t["file"].endswith(".py"):
+            d = t["file"][len("tests/dialects/test_") : -3]
+            dialect_names.add(d)
 
     raw_idx = json.loads(gzip.open(INDEX_FILE, "rb").read().decode("utf-8"))
     idx_test_ids: list[str] = raw_idx["test_ids"]
@@ -355,30 +371,10 @@ def run_selector():
                                 selected.update(SETS[EXPR_CLASS_COV[cname]])
                                 matched_expr_cls = True
                     if not matched_expr_cls:
-                        # Dialect Isolation: confine dialect changes to own tests + dialect + optimizer
                         if rel in DIALECT_COV:
-                            d_tests = SETS[DIALECT_COV[rel]]
-                            if rel.startswith(("sqlglot/dialects/", "sqlglot/generators/", "sqlglot/parsers/")) and not rel.endswith("/dialect.py"):
-                                dname = rel.split("/")[-1][:-3]
-                                allowed_files = [f"tests/dialects/test_{dname}.py"]
-                                # Only the main Dialect class can affect optimizer rules (e.g. WEEK_OFFSET)
-                                if not touched_classes or any(c not in ("Tokenizer", "Parser", "Generator") and not c.endswith(("Tokenizer", "Parser", "Generator")) for c in touched_classes):
-                                    allowed_files.extend(["tests/dialects/test_dialect.py", "tests/test_optimizer.py"])
-                                filtered_d = [n for n in d_tests if tests_by_num[n]["file"] in allowed_files]
-                                selected.update(filtered_d)
-                            else:
-                                selected.update(d_tests)
+                            selected.update(SETS[DIALECT_COV[rel]])
                         if rel in FILE_COV:
-                            f_tests = SETS[FILE_COV[rel]]
-                            if rel.startswith(("sqlglot/dialects/", "sqlglot/generators/", "sqlglot/parsers/")) and not rel.endswith("/dialect.py"):
-                                dname = rel.split("/")[-1][:-3]
-                                allowed_files = [f"tests/dialects/test_{dname}.py"]
-                                if not touched_classes or any(c not in ("Tokenizer", "Parser", "Generator") and not c.endswith(("Tokenizer", "Parser", "Generator")) for c in touched_classes):
-                                    allowed_files.extend(["tests/dialects/test_dialect.py", "tests/test_optimizer.py"])
-                                filtered_f = [n for n in f_tests if tests_by_num[n]["file"] in allowed_files]
-                                selected.update(filtered_f)
-                            else:
-                                selected.update(f_tests)
+                            selected.update(SETS[FILE_COV[rel]])
                         if rel.startswith("sqlglot/expressions/"):
                             for node in t_before.body:
                                 if isinstance(node, ast.ClassDef) and node.name in EXPR_CLASS_COV:
@@ -407,6 +403,30 @@ def run_selector():
         if gen_mem_num is not None:
             if "generator_memory" not in patch_text and "tests/test_generator.py" not in touched_rel_paths:
                 selected.discard(gen_mem_num)
+
+        # Safe Foreign Dialect Exclusion:
+        # If all touched files belong strictly to specific dialects (and not core sqlglot/):
+        # We can safely discard tests for OTHER dialects (e.g. discard DuckDB tests for BigQuery changes).
+        # We KEEP all tests for touched dialects AND all core sqlglot tests (parser, optimizer, expressions, transpile).
+        touched_dialects = set()
+        for f in touched_rel_paths:
+            for d in dialect_names:
+                if f"/{d}.py" in f or f"/{d}/" in f or f"test_{d}.py" in f:
+                    touched_dialects.add(d)
+
+        is_dialect_only = bool(touched_dialects) and all(
+            any(k in f for k in ["dialects/", "generators/", "parsers/", "typing/"])
+            and not f.endswith("dialects/dialect.py")
+            for f in touched_rel_paths
+        )
+
+        if is_dialect_only:
+            for t in list(selected):
+                t_file = tests_by_num[t]["file"]
+                if t_file.startswith("tests/dialects/test_") and t_file.endswith(".py"):
+                    d = t_file[len("tests/dialects/test_") : -3]
+                    if d not in touched_dialects and d != "dialect":
+                        selected.discard(t)
 
         final_selected = set(selected)
 
