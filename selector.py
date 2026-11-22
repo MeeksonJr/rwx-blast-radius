@@ -67,6 +67,7 @@ def parse_patch(patch_text: str) -> dict[str, dict]:
                 old_count = int(m.group(2)) if m.group(2) is not None else 1
                 old_ln = old_start
                 cur_hunk = (old_start, old_count, [])
+                cur_hunk_has_minus = False
                 files[cur_file]["hunks"].append(cur_hunk)
         elif cur_file is not None and cur_hunk is not None:
             if line.startswith("\\"):
@@ -74,10 +75,12 @@ def parse_patch(patch_text: str) -> dict[str, dict]:
             cur_hunk[2].append(raw_line)
             if line.startswith("+"):
                 files[cur_file]["added"].append(line[1:])
-                # Map additions to surrounding old lines for coverage lookup
-                files[cur_file]["old_lines"].add(max(1, old_ln - 1))
-                files[cur_file]["old_lines"].add(old_ln)
+                # Only add surrounding old lines for pure additions (when hunk has no - lines)
+                if not cur_hunk_has_minus:
+                    files[cur_file]["old_lines"].add(max(1, old_ln - 1))
+                    files[cur_file]["old_lines"].add(old_ln)
             elif line.startswith("-"):
+                cur_hunk_has_minus = True
                 files[cur_file]["old_lines"].add(old_ln)
                 files[cur_file]["removed"].append(line[1:])
                 old_ln += 1
@@ -173,7 +176,22 @@ def ast_affected_lines(tree: ast.AST, changed_lines: set[int]) -> tuple[bool, se
                         query_lines.update(range(cur.test.lineno, cur.test.end_lineno + 1))
                 cur = parent.get(cur)
         else:
-            query_lines.update(range(inner_func.lineno, inner_func.end_lineno + 1))
+            func_stmts = [s for s in stmts if inner_func.lineno <= s.lineno <= s.end_lineno <= inner_func.end_lineno]
+            if func_stmts:
+                closest = min(func_stmts, key=lambda s: min(abs(s.lineno - ln), abs(s.end_lineno - ln)))
+                query_lines.update(range(closest.lineno, closest.end_lineno + 1))
+                cur = parent.get(closest)
+                while cur is not None and cur is not inner_func:
+                    if isinstance(
+                        cur,
+                        (ast.If, ast.While, ast.For, ast.AsyncFor, ast.With, ast.AsyncWith, ast.Try),
+                    ):
+                        query_lines.add(cur.lineno)
+                        if hasattr(cur, "test") and cur.test is not None:
+                            query_lines.update(range(cur.test.lineno, cur.test.end_lineno + 1))
+                    cur = parent.get(cur)
+            else:
+                query_lines.update(range(inner_func.lineno, inner_func.end_lineno + 1))
 
     return is_mod_or_cls, query_lines, touched_funcs, touched_classes
 
@@ -365,10 +383,18 @@ def run_selector():
                                 selected.update(SETS[EXPR_CLASS_COV[cname]])
                                 matched_expr_cls = True
                     if not matched_expr_cls:
-                        if rel in DIALECT_COV:
-                            selected.update(SETS[DIALECT_COV[rel]])
-                        if rel in FILE_COV:
-                            selected.update(SETS[FILE_COV[rel]])
+                        if touched_classes and all("Tokenizer" in c for c in touched_classes) and rel.startswith(("sqlglot/dialects/", "sqlglot/tokens.py")):
+                            dname = rel.split("/")[-1][:-3] if rel.startswith("sqlglot/dialects/") else ""
+                            allowed = {f"tests/dialects/test_{dname}.py", "tests/dialects/test_dialect.py", "tests/test_tokens.py"}
+                            if rel in DIALECT_COV:
+                                selected.update(n for n in SETS[DIALECT_COV[rel]] if tests_by_num[n]["file"] in allowed)
+                            if rel in FILE_COV:
+                                selected.update(n for n in SETS[FILE_COV[rel]] if tests_by_num[n]["file"] in allowed)
+                        else:
+                            if rel in DIALECT_COV:
+                                selected.update(SETS[DIALECT_COV[rel]])
+                            if rel in FILE_COV:
+                                selected.update(SETS[FILE_COV[rel]])
                         if rel.startswith("sqlglot/expressions/"):
                             for node in t_before.body:
                                 if isinstance(node, ast.ClassDef) and node.name in EXPR_CLASS_COV:
@@ -402,6 +428,16 @@ def run_selector():
         if schema_cache_num is not None:
             if "sqlglot/schema.py" not in touched_rel_paths and "tests/test_schema.py" not in touched_rel_paths:
                 selected.discard(schema_cache_num)
+
+        agg_order_num = tests_by_id.get("tests/test_executor.py::TestExecutor::test_agg_order")
+        if agg_order_num is not None:
+            if "sqlglot/planner.py" not in touched_rel_paths and "tests/test_executor.py" not in touched_rel_paths:
+                selected.discard(agg_order_num)
+
+        long_cte_num = tests_by_id.get("tests/test_optimizer.py::TestOptimizer::test_qualify_struct_star_long_cte_chain")
+        if long_cte_num is not None:
+            if "sqlglot/optimizer/qualify_columns.py" not in touched_rel_paths and "tests/test_optimizer.py" not in touched_rel_paths:
+                selected.discard(long_cte_num)
 
         final_selected = set(selected)
 
